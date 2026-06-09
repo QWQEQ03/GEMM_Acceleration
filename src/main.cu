@@ -80,8 +80,9 @@ int main() {
         float* h_C_cpu = (float*)malloc(matrix_bytes);
         float* h_C_naive = (float*)malloc(matrix_bytes);
         float* h_C_tiled = (float*)malloc(matrix_bytes);
+        float* h_C_coarse = (float*)malloc(matrix_bytes);
 
-        if (!h_A || !h_B || !h_C_cpu || !h_C_naive || !h_C_tiled) {
+        if (!h_A || !h_B || !h_C_cpu || !h_C_naive || !h_C_tiled || !h_C_coarse) {
             fprintf(stderr, "[Error] Host 内存分配失败 (N=%d)\n", N);
             return EXIT_FAILURE;
         }
@@ -164,6 +165,7 @@ int main() {
         print_result(res_naive);
 
         // ---------------------------------------------------------
+        // ---------------------------------------------------------
         // 3. GPU Tiled (Shared Memory 分块优化)
         // ---------------------------------------------------------
         // Warm-up
@@ -198,6 +200,37 @@ int main() {
         print_result(res_tiled);
 
         // ---------------------------------------------------------
+        // 4. GPU Tiled + Coarse (线程粗化，每个线程计算 2 个元素)
+        // ---------------------------------------------------------
+        // Warm-up
+        gemm_gpu_tiled_coarse(d_A, d_B, d_C, M, N, K);
+        cudaDeviceSynchronize();
+
+        // 正式计时
+        gpu_timer.start();
+        gemm_gpu_tiled_coarse(d_A, d_B, d_C, M, N, K);
+        gpu_timer.stop();
+        float coarse_ms = gpu_timer.elapsed_ms();
+
+        cudaMemcpy(h_C_coarse, d_C, matrix_bytes, cudaMemcpyDeviceToHost);
+
+        bool coarse_pass = true;
+        if (run_cpu) {
+            coarse_pass = compare_matrices(h_C_cpu, h_C_coarse, N, N, EPSILON);
+        } else {
+            coarse_pass = compare_matrices(h_C_naive, h_C_coarse, N, N, EPSILON);
+        }
+
+        Result res_coarse;
+        res_coarse.N = N;
+        res_coarse.algo = "GPU-Tiled-Coarse";
+        res_coarse.time_ms = coarse_ms;
+        res_coarse.gflops = calc_gflops(M, N, K, coarse_ms);
+        res_coarse.speedup = run_cpu ? (cpu_time_ms / coarse_ms) : -1.0;
+        res_coarse.verified = coarse_pass;
+        print_result(res_coarse);
+
+        // ---------------------------------------------------------
         // 资源释放：严格配对 malloc/free 与 cudaMalloc/cudaFree，防止内存泄漏
         // ---------------------------------------------------------
         free(h_A);
@@ -205,6 +238,7 @@ int main() {
         free(h_C_cpu);
         free(h_C_naive);
         free(h_C_tiled);
+        free(h_C_coarse);
         cudaFree(d_A);
         cudaFree(d_B);
         cudaFree(d_C);

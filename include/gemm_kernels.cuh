@@ -44,4 +44,14 @@ void gemm_gpu_naive(const float* A, const float* B, float* C, int M, int N, int 
  */
 void gemm_gpu_tiled(const float* A, const float* B, float* C, int M, int N, int K);
 
+/**
+ * @brief GPU 端共享内存分块 + 线程粗化 GEMM 实现
+ *        每个线程负责计算输出矩阵中同行相邻的 2 个元素，
+ *        通过增加寄存器累加器数量来更好地掩盖访存延迟。
+ * @param A 设备端输入矩阵 (行优先), 尺寸 M × K
+ * @param B 设备端输入矩阵 (行优先), 尺寸 K × N
+ * @param C 设备端输出矩阵 (行优先), 尺寸 M × N
+ */
+void gemm_gpu_tiled_coarse(const float* A, const float* B, float* C, int M, int N, int K);
+
 #endif // GEMM_KERNELS_CUH

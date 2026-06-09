@@ -169,3 +169,144 @@ void gemm_gpu_tiled(const float* A, const float* B, float* C, int M, int N, int 
     // 这对于在 Host 端进行准确的 GPU 计时或立即读取结果至关重要。
     cudaDeviceSynchronize();
 }
+
+// =============================================================
+// 线程粗化 (Thread Coarsening) 扩展
+// =============================================================
+
+/**
+ * @brief CUDA Kernel: 共享内存分块 + 线程粗化 GEMM
+ *
+ * 粗化策略（列方向 Coarsening Factor = 2）：
+ * 标准 Tiled 版本中，一个 Block (BLOCK_SIZE × BLOCK_SIZE) 负责计算 BLOCK_SIZE × BLOCK_SIZE
+ * 的输出子块。每个线程只算 1 个元素。
+ *
+ * 粗化版本中，每个线程负责计算**同行相邻的 2 个元素**（col 和 col+BLOCK_SIZE）。
+ * 因此，一个 Block 实际负责计算的输出区域变为 BLOCK_SIZE 行 × (2*BLOCK_SIZE) 列。
+ * Grid 的 x 维度相应减半：grid.x = (N + 2*BLOCK_SIZE - 1) / (2*BLOCK_SIZE)。
+ *
+ * 为什么粗化能提升性能？
+ * 1. 分摊 Shared Memory 加载开销：
+ *    加载 A 的子块到 sA 的代价被分摊到了 2 个输出元素的计算上。
+ *    每个线程从 sA 读取一次 a_val，但用它计算了 2 个独立的内积（sum0 和 sum1）。
+ * 2. 更好地掩盖访存延迟：
+ *    增加寄存器累加器数量（sum0, sum1）提升了指令级并行 (ILP)，
+ *    使 Warp Scheduler 有更多独立指令可调度，从而更好地隐藏 Shared Memory 的读取延迟。
+ * 3. 减少 Block 数量和调度开销：
+ *    Grid 规模缩小为原来的一半（x 方向），减少了 Kernel 启动和 Block 调度的固定开销。
+ *
+ * Shared Memory 布局变化：
+ * - sA 保持不变：[BLOCK_SIZE][BLOCK_SIZE]
+ * - sB 加宽一倍：[BLOCK_SIZE][2*BLOCK_SIZE]，以容纳同时加载的 2 列 B 元素。
+ * - 每个 Block 的 Shared Memory 总量从 2KB 增加到 3KB（BLOCK_SIZE=16 时），
+ *   仍在 SM 限制内，对 Occupancy 影响极小。
+ *
+ * 加载阶段：
+ * - 每个线程仍需加载 1 个 A 元素（因为 A 的列维度未变）。
+ * - 每个线程需要加载 2 个 B 元素（因为 B 的列范围扩展了一倍），
+ *   分别存入 sB[ty][tx] 和 sB[ty][tx+BLOCK_SIZE]。
+ */
+__global__ void gemm_tiled_coarse_kernel(const float* __restrict__ A,
+                                         const float* __restrict__ B,
+                                         float* __restrict__ C,
+                                         int M, int N, int K) {
+    // sA 保持不变，sB 宽度加倍以覆盖 2 倍列数
+    __shared__ float sA[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ float sB[BLOCK_SIZE][2 * BLOCK_SIZE];
+
+    // 当前线程负责的第 1 个元素的全局坐标
+    int row = blockIdx.y * BLOCK_SIZE + threadIdx.y;
+    int col = blockIdx.x * (2 * BLOCK_SIZE) + threadIdx.x;
+
+    // 2 个寄存器累加器：分别累加同行相邻的 2 个输出元素
+    float sum0 = 0.0f;
+    float sum1 = 0.0f;
+
+    int numTiles = (K + BLOCK_SIZE - 1) / BLOCK_SIZE;
+
+    for (int tile = 0; tile < numTiles; ++tile) {
+        // -------------------------------------------------
+        // 阶段一：协作加载 A（每个线程 1 个元素）
+        // -------------------------------------------------
+        int aRow = blockIdx.y * BLOCK_SIZE + threadIdx.y;
+        int aCol = tile * BLOCK_SIZE + threadIdx.x;
+
+        if (aRow < M && aCol < K) {
+            sA[threadIdx.y][threadIdx.x] = A[aRow * K + aCol];
+        } else {
+            sA[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        // -------------------------------------------------
+        // 阶段一（续）：协作加载 B（每个线程 2 个元素）
+        // 因为输出子块在列方向扩展了 2 倍，B 的加载范围也相应加倍
+        // -------------------------------------------------
+        int bRow = tile * BLOCK_SIZE + threadIdx.y;
+        int bCol0 = blockIdx.x * (2 * BLOCK_SIZE) + threadIdx.x;
+        int bCol1 = bCol0 + BLOCK_SIZE;
+
+        if (bRow < K && bCol0 < N) {
+            sB[threadIdx.y][threadIdx.x] = B[bRow * N + bCol0];
+        } else {
+            sB[threadIdx.y][threadIdx.x] = 0.0f;
+        }
+
+        if (bRow < K && bCol1 < N) {
+            sB[threadIdx.y][threadIdx.x + BLOCK_SIZE] = B[bRow * N + bCol1];
+        } else {
+            sB[threadIdx.y][threadIdx.x + BLOCK_SIZE] = 0.0f;
+        }
+
+        // -------------------------------------------------
+        // 阶段二：同步，确保 Shared Memory 就绪
+        // -------------------------------------------------
+        __syncthreads();
+
+        // -------------------------------------------------
+        // 阶段三：基于 Shared Memory 的乘加计算（粗化版）
+        // 每个线程同时计算 2 个输出元素：
+        // sum0 对应 C[row][col]，sum1 对应 C[row][col+BLOCK_SIZE]
+        // 同一个 a_val 被复用 2 次，减少了对 sA 的重复读取
+        // -------------------------------------------------
+        #pragma unroll
+        for (int k = 0; k < BLOCK_SIZE; ++k) {
+            float a_val = sA[threadIdx.y][k];
+            sum0 += a_val * sB[k][threadIdx.x];
+            sum1 += a_val * sB[k][threadIdx.x + BLOCK_SIZE];
+        }
+
+        // -------------------------------------------------
+        // 阶段四：再次同步，防止下一轮加载覆盖数据
+        // -------------------------------------------------
+        __syncthreads();
+    }
+
+    // -------------------------------------------------
+    // 阶段五：将 2 个累加结果写回 Global Memory
+    // -------------------------------------------------
+    if (row < M) {
+        if (col < N) {
+            C[row * N + col] = sum0;
+        }
+        if (col + BLOCK_SIZE < N) {
+            C[row * N + col + BLOCK_SIZE] = sum1;
+        }
+    }
+}
+
+/**
+ * @brief Host 端封装：启动 Tiled + Coarse GEMM Kernel
+ *
+ * Grid 维度调整：
+ * - x 方向覆盖 N 列，但由于每个 Block 覆盖 2*BLOCK_SIZE 列，
+ *   grid.x = (N + 2*BLOCK_SIZE - 1) / (2*BLOCK_SIZE)
+ * - y 方向不变，仍覆盖 M 行
+ */
+void gemm_gpu_tiled_coarse(const float* A, const float* B, float* C, int M, int N, int K) {
+    dim3 block(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 grid((N + 2 * BLOCK_SIZE - 1) / (2 * BLOCK_SIZE),
+              (M + BLOCK_SIZE - 1) / BLOCK_SIZE);
+
+    gemm_tiled_coarse_kernel<<<grid, block>>>(A, B, C, M, N, K);
+    cudaDeviceSynchronize();
+}
