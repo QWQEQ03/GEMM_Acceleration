@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(nvcc --version)",
+      "Bash(lsb_release -a)",
+      "Read(//usr/lib/**)",
+      "Bash(rm -rf build)",
+      "Bash(mkdir build *)",
+      "Bash(cmake ..)",
+      "Bash(ldd /home/administrator/GEMM_Acceleration/build/gemm_acc)",
+      "Bash(./gemm_acc *)",
+      "Bash(nvidia-smi)",
+      "Bash(cuda-smi)"
+    ]
+  }
+}
