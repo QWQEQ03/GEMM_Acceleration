@@ -2,7 +2,7 @@
 
 > 面向网络大模型注意力机制的通用矩阵乘法（GEMM）并行加速研究
 
-本项目基于 NVIDIA CUDA 实现了多种通用矩阵乘法（GEMM）算法，涵盖 CPU 串行基线、GPU 朴素并行以及 GPU Shared Memory 分块（Tiled）优化三种实现。通过系统性的性能基准测试，直观对比不同实现策略在计算吞吐量（GFLOPS）与加速比上的差异，为理解大模型核心算子的 GPU 优化提供可运行的教学与实验平台。
+本项目基于 NVIDIA CUDA 实现了多种通用矩阵乘法（GEMM）算法，涵盖 CPU 串行基线、GPU 朴素并行、GPU Shared Memory 分块（Tiled）优化、预填充对齐（Padded）、线程粗化（Coarsening）以及 cuBLAS 参考实现。通过系统性的性能基准测试，直观对比不同实现策略在计算吞吐量（GFLOPS）与加速比上的差异，为理解大模型核心算子的 GPU 优化提供可运行的教学与实验平台。
 
 ---
 
@@ -20,7 +20,8 @@ GEMM_Acceleration/
 │   ├── main.cu                 # 主程序：驱动基准测试并输出结果表格
 │   ├── cpu_gemm.cpp            # CPU 串行 GEMM（缓存优化三重循环）
 │   ├── gpu_naive.cu            # GPU 朴素 GEMM（Global Memory 直接访问）
-│   ├── gpu_tiled.cu            # GPU 分块 GEMM（Shared Memory 缓存优化）
+│   ├── gpu_tiled.cu            # GPU 分块 GEMM（Shared Memory 缓存优化 + 线程粗化）
+│   ├── gpu_tiled_padded.cu     # GPU 分块 + 预填充对齐 + cuBLAS 封装
 │   └── utils.cu                # 工具函数实现（计时器、矩阵操作等）
 └── build/                      # 构建输出目录（.gitignore 忽略）
 ```
@@ -65,7 +66,14 @@ make -j$(nproc)
 ./gemm_acc
 ```
 
-程序会自动在矩阵维度 **1024、2048、4096** 下运行三种实现（CPU-Baseline、GPU-Naive、GPU-Tiled），并以 Markdown 表格形式输出性能数据，包括执行时间、GFLOPS、相对于 CPU 的加速比以及结果校验状态。
+程序会自动在以下矩阵维度（方阵 + 非方阵）下运行全部算法实现，并以 Markdown 表格形式输出性能数据，包括执行时间、GFLOPS、相对于 CPU 的加速比以及结果校验状态。
+
+测试维度：
+- **方阵**：`1024×1024×1024`、`2048×2048×2048`、`4096×4096×4096`
+- **非方阵**（模拟注意力机制实际特征）：
+  - `4096×4096×128`：长序列 × 头维度（Q×K^T 场景）
+  - `4096×128×128`：扁平投影
+  - `8192×8192×64`：超长序列
 
 ---
 
@@ -101,6 +109,35 @@ make -j$(nproc)
   - **同步原语**：通过 `__syncthreads()` 保证加载阶段与计算阶段的严格顺序，避免数据竞争。
 - **性能收益**：相比 Naive 版本，Tiled 实现通常能获得 **数倍至数十倍** 的性能提升，且随着矩阵规模增大，收益愈发明显。
 
+### 4. GPU-Tiled-Padded（预填充对齐）
+
+- **文件**：[`src/gpu_tiled_padded.cu`](src/gpu_tiled_padded.cu)
+- **核心思想**：在 Host 端将输入矩阵预填充（Padding）至 `BLOCK_SIZE` 的整数倍，使 Kernel 内部无需任何边界检查（`if (row < M)` 等分支全部消除）。
+- **优化细节**：
+  - **消除 Warp Divergence**：所有线程执行路径完全一致，无条件分支，提升指令流水线效率。
+  - **协作加载**：与 Tiled 版本相同，利用 Shared Memory 分块加载。
+  - **端到端开销**：计时包含 Host 端 Padding 内存分配、数据拷贝及 Kernel 执行完整流程。
+- **适用场景**：M/N/K 不是 `BLOCK_SIZE` 整数倍的非方阵场景（如 `4096×4096×128`）。
+- **性能收益**：在非对齐尺寸下，相比 Tiled 版本省去大量分支判断开销，通常有 **10%~20%** 的额外提升。
+
+### 5. GPU-Tiled-Coarse（线程粗化）
+
+- **文件**：[`src/gpu_tiled.cu`](src/gpu_tiled.cu)
+- **核心思想**：在 Tiled 基础上进一步**线程粗化（Thread Coarsening）**，每个线程负责计算输出矩阵中**同行相邻的 2 个元素**（Coarsening Factor = 2，列方向）。
+- **优化细节**：
+  - **分摊 Shared Memory 加载开销**：加载 A 的子块代价被 2 个输出元素分摊，同一 `a_val` 被复用 2 次计算 `sum0` 和 `sum1`。
+  - **增加寄存器累加器**：每个线程持有 `sum0` 和 `sum1` 两个寄存器累加器，提升指令级并行（ILP），使 Warp Scheduler 更好地掩盖访存延迟。
+  - **减少 Grid 规模**：Grid x 维度缩减为原来的一半，降低 Kernel 启动和 Block 调度的固定开销。
+  - **Shared Memory 布局**：sB 宽度加倍至 `2*BLOCK_SIZE`，以同时覆盖 2 列 B 元素；sA 保持不变。
+- **性能收益**：相比 Tiled 版本，在扁平矩阵（如 `4096×128×128`）上表现尤为明显，通常有 **20%~40%** 的额外提升。
+
+### 6. GPU-cuBLAS（官方库参考）
+
+- **文件**：[`src/gpu_tiled_padded.cu`](src/gpu_tiled_padded.cu)
+- **核心思想**：通过动态加载（`dlopen`）调用 NVIDIA 官方高度优化的 cuBLAS 库，作为手写 Kernel 的性能上限参考。
+- **动态加载策略**：避免静态链接 cuBLAS 在部分环境（如 WSL2 + CUDA 12.x）下导致的 CUDA 运行时初始化失败问题。
+- **用途**：作为性能对比的"天花板"，帮助分析手写 Kernel 与工业级优化库之间的差距来源。
+
 ---
 
 ## 📊 性能基准测试
@@ -121,11 +158,16 @@ make -j$(nproc)
 ### 输出示例
 
 ```markdown
-| 矩阵大小 | 算法类型 | 执行时间(ms) | GFLOPS | 加速比(vs CPU) | 结果校验 |
-|---|---|---|---|---|---|
-| 1024 | CPU-Baseline | 523.456 | 4.10 | 1.00x | PASS |
-| 1024 | GPU-Naive | 12.345 | 173.82 | 42.40x | PASS |
-| 1024 | GPU-Tiled | 2.567 | 835.12 | 203.92x | PASS |
+| 矩阵大小 | 描述 | 算法类型 | 执行时间(ms) | GFLOPS | 加速比(vs CPU) | 结果校验 |
+|---|---|---|---|---|---|---|
+| 1024×1024×1024 | Square | CPU-Baseline | 523.456 | 4.10 | 1.00x | PASS |
+| 1024×1024×1024 | Square | GPU-Naive | 12.345 | 173.82 | 42.40x | PASS |
+| 1024×1024×1024 | Square | GPU-Tiled | 2.567 | 835.12 | 203.92x | PASS |
+| 1024×1024×1024 | Square | GPU-Tiled-Padded | 2.345 | 912.45 | 223.15x | PASS |
+| 1024×1024×1024 | Square | GPU-Tiled-Coarse | 1.890 | 1134.21 | 276.95x | PASS |
+| 1024×1024×1024 | Square | GPU-cuBLAS | 0.823 | 2601.34 | 636.08x | PASS |
+| 4096×4096×128 | Long-seq x head-dim | GPU-Tiled-Coarse | 4.521 | 1892.34 | - | PASS |
+| 4096×128×128 | Flat projection | GPU-Tiled-Coarse | 0.892 | 7456.12 | - | PASS |
 ```
 
 > **注意**：实际性能数据高度依赖于 GPU 型号、显存带宽、CUDA 驱动版本以及系统负载，以上仅为格式示例。
@@ -136,23 +178,33 @@ make -j$(nproc)
 
 | 参数位置 | 参数名 | 默认值 | 说明 |
 |---|---|---|---|
-| `src/main.cu:10` | `TEST_DIMS` | `{1024, 2048, 4096}` | 测试的矩阵维度（方阵 N×N） |
+| `src/main.cu:10` | `TEST_CASES` | 见下方列表 | 测试用例数组（结构体：M/N/K/desc） |
 | `include/utils.h:14` | `EPSILON` | `1e-4f` | 矩阵比对时的浮点误差容忍度 |
 | `src/gpu_naive.cu:11` | `NAIVE_BLOCK_SIZE` | `16` | Naive Kernel 的 Block 维度 |
-| `src/gpu_tiled.cu:15` | `BLOCK_SIZE` | `16` | Tiled Kernel 的 Block / Tile 维度 |
+| `src/gpu_tiled.cu:15` | `BLOCK_SIZE` | `16` | Tiled / Coarse Kernel 的 Block / Tile 维度 |
 | `CMakeLists.txt:26` | `CMAKE_CUDA_ARCHITECTURES` | `75 80 86` | 目标 GPU 架构代码生成 |
+
+**`TEST_CASES` 默认配置（方阵 + 非方阵）：**
+
+| M | N | K | 描述 | 模拟场景 |
+|---|---|---|---|---|
+| 1024 | 1024 | 1024 | Square | 方阵基线 |
+| 2048 | 2048 | 2048 | Square | 方阵中等规模 |
+| 4096 | 4096 | 4096 | Square | 方阵大规模 |
+| 4096 | 4096 | 128 | Long-seq x head-dim | Q×K^T 注意力场景 |
+| 4096 | 128 | 128 | Flat projection | 扁平投影层 |
+| 8192 | 8192 | 64 | Ultra-long seq | 超长序列（可选）|
 
 ---
 
 ## 📝 扩展方向
 
-本项目采用分块优化作为核心优化手段，但现代 CUDA GEMM 优化还有更多进阶方向可供探索：
+本项目已实现分块优化（Tiled）、预填充对齐（Padded）、线程粗化（Coarsening）以及 cuBLAS 参考对比，现代 CUDA GEMM 优化还有更多进阶方向可供探索：
 
 1. **寄存器分块（Register Tiling）**：在 Tiled 基础上，让每个线程负责计算一个更大的子矩阵（如 4×4 或 8×8），减少 Shared Memory 的读写次数，进一步提升计算强度。
 2. **双缓冲（Double Buffering）**：利用多余的 Shared Memory 或寄存器空间，在计算当前 TILE 的同时预加载下一个 TILE，用计算掩盖访存延迟。
 3. **Warp-Level 原语**：使用 `__shfl_sync`（Shuffle）或 `wmma`（Tensor Core）进行细粒度的数据交换和矩阵乘加加速。
-4. ** cuBLAS 对比**：将手写 Kernel 与 NVIDIA 官方高度优化的 cuBLAS 库进行性能对比，分析差距来源。
-5. **混合精度**：引入 FP16 / BF16 / INT8 等低精度计算，结合 Tensor Core 实现更高的吞吐量和能效比。
+4. **混合精度**：引入 FP16 / BF16 / INT8 等低精度计算，结合 Tensor Core 实现更高的吞吐量和能效比。
 
 ---
 

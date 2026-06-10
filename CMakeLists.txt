@@ -34,6 +34,7 @@ set(SOURCES
     src/cpu_gemm.cpp
     src/gpu_naive.cu
     src/gpu_tiled.cu
+    src/gpu_tiled_padded.cu
 )
 
 # ---------------------------------------------------------
@@ -53,6 +54,7 @@ target_include_directories(gemm_acc PRIVATE
 # ---------------------------------------------------------
 target_link_libraries(gemm_acc PRIVATE
     CUDA::cudart
+    dl
 )
 
 # ---------------------------------------------------------

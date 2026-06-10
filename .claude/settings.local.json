@@ -10,7 +10,11 @@
       "Bash(ldd /home/administrator/GEMM_Acceleration/build/gemm_acc)",
       "Bash(./gemm_acc *)",
       "Bash(nvidia-smi)",
-      "Bash(cuda-smi)"
+      "Bash(cuda-smi)",
+      "Bash(cuda-memcheck ./gemm_acc)",
+      "Bash(gdb -batch -ex \"run\" -ex \"bt\" ./gemm_acc)",
+      "Bash(ldd ./gemm_acc)",
+      "Bash(/tmp/test_device)"
     ]
   }
 }

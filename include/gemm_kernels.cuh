@@ -54,4 +54,27 @@ void gemm_gpu_tiled(const float* A, const float* B, float* C, int M, int N, int 
  */
 void gemm_gpu_tiled_coarse(const float* A, const float* B, float* C, int M, int N, int K);
 
+/**
+ * @brief GPU 端共享内存分块 + 预填充 (Padding) GEMM 实现
+ *        将输入矩阵在 Host 端预填充至 BLOCK_SIZE 的整数倍，
+ *        Kernel 内部无需边界判断，消除分支开销，适合非对齐尺寸。
+ * @param A 设备端输入矩阵 (行优先), 尺寸 padM × padK
+ * @param B 设备端输入矩阵 (行优先), 尺寸 padK × padN
+ * @param C 设备端输出矩阵 (行优先), 尺寸 padM × padN
+ * @param M N K 原始矩阵维度（用于结果裁剪）
+ * @param padM padN padK 填充后的对齐维度
+ */
+void gemm_gpu_tiled_padded(const float* A, const float* B, float* C, int M, int N, int K,
+                           int padM, int padN, int padK);
+
+/**
+ * @brief GPU 端 cuBLAS GEMM 实现
+ *        调用 NVIDIA 官方高度优化的 cuBLAS 库作为性能上限参考。
+ *        内部处理行/列优先转换。
+ * @param A 设备端输入矩阵 (行优先逻辑), 尺寸 M × K
+ * @param B 设备端输入矩阵 (行优先逻辑), 尺寸 K × N
+ * @param C 设备端输出矩阵 (行优先逻辑), 尺寸 M × N
+ */
+void gemm_gpu_cublas(const float* A, const float* B, float* C, int M, int N, int K);
+
 #endif // GEMM_KERNELS_CUH
