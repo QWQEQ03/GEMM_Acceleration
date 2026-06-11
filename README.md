@@ -23,6 +23,10 @@ GEMM_Acceleration/
 │   ├── gpu_tiled.cu            # GPU 分块 GEMM（Shared Memory 缓存优化 + 线程粗化）
 │   ├── gpu_tiled_padded.cu     # GPU 分块 + 预填充对齐 + cuBLAS 封装
 │   └── utils.cu                # 工具函数实现（计时器、矩阵操作等）
+├── scripts/
+│   ├── parse_benchmark.py      # 解析 gemm_acc Markdown 输出 → CSV 文件
+│   └── plot_results.py         # 读取 CSV → 可视化图表（柱状图/折线图）
+├── results/                    # 输出目录（.gitignore 忽略）
 └── build/                      # 构建输出目录（.gitignore 忽略）
 ```
 
@@ -74,6 +78,48 @@ make -j$(nproc)
   - `4096×4096×128`：长序列 × 头维度（Q×K^T 场景）
   - `4096×128×128`：扁平投影
   - `8192×8192×64`：超长序列
+
+---
+
+## 📈 数据解析与可视化
+
+### 脚本说明
+
+| 脚本 | 功能 | 依赖 |
+|---|---|---|
+| [`scripts/parse_benchmark.py`](scripts/parse_benchmark.py) | 解析 `gemm_acc` 的 Markdown 表格输出，保存为 CSV 文件 | Python 3 标准库 |
+| [`scripts/plot_results.py`](scripts/plot_results.py) | 读取 CSV，绘制 GFLOPS / 执行时间 / 加速比图表 | `matplotlib` |
+
+### 用法
+
+```bash
+# 编译（如尚未编译）
+cd build && cmake .. && make -j$(nproc)
+
+# 运行基准测试，解析并可视化
+./gemm_acc 2>&1 | python3 ../scripts/parse_benchmark.py && python3 ../scripts/plot_results.py
+```
+
+### 输出文件
+
+运行后在 `results/` 目录下生成：
+
+| 文件 | 说明 |
+|---|---|
+| `benchmark_results.csv` | 结构化 CSV，含 M/N/K/算法/时间/GFLOPs/加速比/校验结果 |
+| `benchmark_gflops_bar.png` | GFLOPS 分组柱状图（各算法按矩阵大小分组） |
+| `benchmark_time_bar.png` | 执行时间分组柱状图 |
+| `benchmark_gflops_line.png` | GFLOPS 折线图（GPU 算法随规模变化趋势） |
+| `benchmark_speedup_line.png` | 加速比折线图（相对 CPU 的加速比） |
+
+### CSV 格式
+
+```
+M,N,K,description,algorithm,time_ms,gflops,speedup,verified
+1024,1024,1024,Square,CPU-Baseline,2181.281,0.98,1.0,PASS
+1024,1024,1024,Square,GPU-Naive,3.703,579.96,589.09,PASS
+...
+```
 
 ---
 

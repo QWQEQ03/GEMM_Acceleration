@@ -14,7 +14,15 @@
       "Bash(cuda-memcheck ./gemm_acc)",
       "Bash(gdb -batch -ex \"run\" -ex \"bt\" ./gemm_acc)",
       "Bash(ldd ./gemm_acc)",
-      "Bash(/tmp/test_device)"
+      "Bash(/tmp/test_device)",
+      "Bash(chmod +x /home/administrator/GEMM_Acceleration/scripts/parse_benchmark.py /home/administrator/GEMM_Acceleration/scripts/plot_results.py)",
+      "Bash(python ../scripts/parse_benchmark.py --output ../scripts/benchmark_results.csv)",
+      "Bash(python3 ../scripts/parse_benchmark.py --output ../scripts/benchmark_results.csv)",
+      "Bash(python3 ../scripts/plot_results.py --input ../scripts/benchmark_results.csv --output ../scripts/)",
+      "Bash(pip3 install *)",
+      "Bash(python3 ../scripts/parse_benchmark.py)",
+      "Bash(python3 ../scripts/plot_results.py)",
+      "Read(//home/administrator/**)"
     ]
   }
 }
