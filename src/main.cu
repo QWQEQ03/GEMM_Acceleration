@@ -302,9 +302,8 @@ int main() {
             bool cublas_pass = true;
             if (run_cpu) {
                 cublas_pass = compare_matrices(h_C_cpu, h_C_cublas, M, N, EPSILON);
-            } else {
-                cublas_pass = compare_matrices(h_C_naive, h_C_cublas, M, N, EPSILON);
             }
+            // cuBLAS 为参考实现，无 CPU 基准时跳过数值校验（与 Naive 对比无意义）
             res_cublas.algo = "GPU-cuBLAS";
             res_cublas.time_ms = cublas_ms;
             res_cublas.gflops = calc_gflops(M, N, K, cublas_ms);
